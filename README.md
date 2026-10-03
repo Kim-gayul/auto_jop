@@ -1,6 +1,6 @@
 # Heyzzabi | 회의에서 업무 배정까지 이어지는 AI 협업 도구
 
-<p align="center"><img src="산출물/images/main.png" alt="Heyzzabi 서비스 화면" width="700"></p>
+<p align="center"><img src="산출물/images/heyzzabi-promo.png" alt="Heyzzabi — 회의에서 업무 배정까지, AI가 초안을 만들고 PM이 승인합니다" width="700"></p>
 
 회의 내용을 바탕으로 기획서와 요구사항 정의서를 만들고, 업무 분해와 담당자 추천까지 이어 주는 팀 프로젝트입니다. AI가 초안을 작성하면 PM이 단계별로 검토하고 승인합니다. 이 저장소는 SKN31 31기 1팀 프로젝트의 **공개용 소스 복사본**입니다.
 
