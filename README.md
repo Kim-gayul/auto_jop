@@ -23,6 +23,7 @@
 | 데이터베이스 | 로컬 SQLite 또는 MySQL |
 | 배포에 사용한 구성 | Vercel, Nginx, Gunicorn, AWS EC2/RDS |
 
+## 시스템 아키텍처 
 <p align="center"><img src="산출물/images/시스템아키텍처.png" alt="시스템 아키텍처" width="700"></p>
 
 ## 저장소 구성
@@ -77,6 +78,3 @@ npm run dev
 
 테스트 스크립트는 [`artifacts/load-test`](artifacts/load-test)에 있습니다. 이 스크립트들은 전용 MySQL 테스트 DB와 테스트 계정을 요구합니다. 일반 기능 검증은 백엔드의 Django 테스트와 프론트엔드의 `npm test`를 사용할 수 있습니다.
 
-## 기여자
-
-SKN31 31기 1팀: 박연아, 김가율, 김재원, 이재일, 박하린. 공개와 라이선스 범위는 팀 확인 후 확정해야 합니다.
