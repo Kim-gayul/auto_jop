@@ -1,0 +1,116 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/lib/auth";
+import { Loader2, User, Lock, ShieldAlert, Info } from "lucide-react";
+
+export default function LoginPage() {
+  const { login } = useAuth();
+  const router = useRouter();
+  const [userId, setUserId] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  // 세션이 강제 종료돼서(예: 다른 기기 로그인) 로그인 화면으로 밀려난 경우, auth.tsx가
+  // 사유를 sessionStorage에 남겨둔다 — 여기서 한 번만 보여주고 지운다(새로고침해도 안 남게).
+  const [logoutReason, setLogoutReason] = useState("");
+  useEffect(() => {
+    const reason = sessionStorage.getItem("hz_logout_reason");
+    if (reason) {
+      setLogoutReason(reason);
+      sessionStorage.removeItem("hz_logout_reason");
+    }
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+
+    try {
+      // 2026-08-31: 예전엔 "@heyzzabi.com"을 붙여 이메일 형태로 보냈는데, 실제 Django
+      // 백엔드(User.username)는 그런 변환 없이 입력한 아이디 그대로를 쓴다("pm", "newbie" 등) —
+      // 붙여 보내면 authenticate()가 항상 실패해서(400) 로그인 자체가 안 됐다.
+      await login(userId, password);
+      // 로그인 성공 시 대시보드(또는 온보딩)로 강제 이동
+      router.push("/");
+    } catch (err: any) {
+      setError(err.message);
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="sm:mx-auto sm:w-full sm:max-w-md animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <div className="text-center mb-8">
+        <h2 className="text-3xl font-extrabold tracking-tight">HeyZzabi 로그인</h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          B2B 전용 계정입니다. 계정이 없다면 PM에게 문의하세요.
+        </p>
+      </div>
+
+      <div className="glass py-8 px-4 shadow sm:rounded-2xl sm:px-10 border border-border relative overflow-hidden">
+        {/* Decor */}
+        <div className="absolute -top-10 -right-10 w-32 h-32 bg-primary/20 blur-3xl rounded-full pointer-events-none" />
+
+        <form className="space-y-6 relative z-10" onSubmit={handleSubmit}>
+          {logoutReason && !error && (
+            <div className="p-3 rounded-lg bg-blue-500/10 border border-blue-500/20 text-blue-500 text-sm flex items-center gap-2">
+              <Info className="w-4 h-4 shrink-0" /> {logoutReason}
+            </div>
+          )}
+          {error && (
+            <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-500 text-sm flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4 shrink-0" /> {error}
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium">사내 아이디 (ID)</label>
+            <div className="mt-1 relative rounded-md shadow-sm flex">
+              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                <User className="h-5 w-5 text-muted-foreground" />
+              </div>
+              <input
+                type="text"
+                required
+                className="block w-full pl-10 sm:text-sm bg-black/5 dark:bg-white/5 border border-border rounded-xl py-3 focus:ring-2 focus:ring-primary/50 focus:outline-none placeholder:text-muted-foreground"
+                placeholder="아이디"
+                value={userId}
+                onChange={(e) => setUserId(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium">비밀번호</label>
+            <div className="mt-1 relative rounded-md shadow-sm flex">
+              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                <Lock className="h-5 w-5 text-muted-foreground" />
+              </div>
+              <input
+                type="password"
+                required
+                className="block w-full pl-10 sm:text-sm bg-black/5 dark:bg-white/5 border border-border rounded-xl py-3 focus:ring-2 focus:ring-primary/50 focus:outline-none placeholder:text-muted-foreground"
+                placeholder="비밀번호"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div>
+            <button
+              type="submit"
+              disabled={loading || !userId || !password}
+              className="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-bold text-white bg-primary hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-50 transition-colors"
+            >
+              {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : "로그인"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}

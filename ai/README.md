@@ -1,0 +1,62 @@
+# AI 에이전트 개발 디렉토리 구조
+
+Track A(문서 생성 파이프라인)와 Track B(RAG 챗봇) 7개 에이전트의 실행 스켈레톤
+
+## 구조
+
+```
+agents_project/
+├── shared/                       # 공통 모듈
+│   ├── llm_client.py              #   Instructor 클라이언트 생성
+│   ├── retry_config.py            #   모델·재시도 기본값
+│   └── schemas_base.py            #   공통 Enum (Priority, ReviewStatus, Source)
+│
+├── meeting_analysis/         # 회의록 AI 구조화 분석
+├── plan_draft/               # 기획서 초안 생성
+├── requirement_draft/        # 요구사항정의서 초안 생성
+├── task_generation/          # 업무 자동 생성
+├── assignee_recommend/       # AI 담당자 추천 (하이브리드: 규칙+LLM)
+├── retrieval/                  # 문서 임베딩·검색 (Qdrant)
+├── qa_answer/                  # RAG 질의응답 + 근거출처
+│
+└── tests/
+    ├── fixtures/                  #   테스트용 더미 데이터
+    └── test_a2_1.py               #   스키마·프롬프트 조립 테스트
+```
+
+각 에이전트 폴더는 동일한 패턴을 따른다.
+
+| 파일 | 역할 |
+|---|---|
+| `agent.py` | 노드 진입점(Django 서비스 레이어가 직접 호출), 실행 로직 |
+| `schemas.py` | 입출력 계약 (Pydantic) |
+| `prompt_builder.py` | 고정 규칙(YAML) + 동적 데이터를 system prompt로 조립 |
+| `prompts/*.yaml` | 역할·제약사항·few-shot (정적 자산) |
+
+## 실행 준비
+
+```bash
+pip install instructor anthropic pydantic pyyaml pytest
+export OPEN_API_KEY=...
+python -m pytest tests/ -v
+```
+
+## AI 모델 교체 및 현재 설정된 모델 확인 방법
+
+
+## 0. 준비 (터미널 열 때마다)
+
+```bash
+cd ~/projects/SKN31-FINAL-1Team/ai
+source ../.venv/bin/activate
+```
+
+이후 `python` = 프로젝트 venv입니다. (activate 안 하려면 아래 모든 `python`을 `../.venv/bin/python`으로)
+
+## 1. 지금 설정된 모델 확인
+
+```bash
+python -m shared.retry_config
+```
+
+

@@ -1,0 +1,398 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import { X, Loader2, FileText, Users, CalendarIcon, FolderKanban, Paperclip } from "lucide-react";
+import { apiFetch, directUploadFetch } from "@/lib/api/client";
+import { formatTranscriptSentences } from "@/lib/transcript";
+import TagAutocomplete from "@/components/ui/TagAutocomplete";
+
+type ProjectOption = { id: number; name: string };
+
+// 2026-09-01: /api/meetings/notes/parse-file/ (.docx/.pdf/.txt/.hwp 지원 — .hwp는 hwp5txt
+// CLI를 서브프로세스로 호출) 로 파일을 올리면 텍스트를 추출해 "원본 내용" 칸을 채운다.
+// gpt-transcribe 전사문은 표현을 수정하지 않고 문장 사이에 줄바꿈만 넣어 표시한다.
+const AUDIO_EXTENSIONS = [".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"];
+const isAudioFile = (filename: string) => AUDIO_EXTENSIONS.some(ext => filename.toLowerCase().endsWith(ext));
+
+// 이 도구는 개발 회의록 전문 서비스라, 개발과 무관한 회의록/음성이 섞여 들어오면 안 된다는
+// 요청(팀원)에 따라 첨부 파일명이 "개발_"로 시작하는지를 서버 호출 전에 먼저 막는다 — 파일
+// 내용을 읽고 나서 걸러내면 이미 Whisper/파일 파싱 API를 호출해 비용이 든 뒤라, 파일명만
+// 보고 바로 거부하는 게 가장 저렴하고 빠르다.
+const REQUIRED_FILENAME_PREFIX = "개발_";
+const hasRequiredPrefix = (filename: string) => filename.startsWith(REQUIRED_FILENAME_PREFIX);
+
+type AudioStage = "transcribing" | null;
+// 서버의 중간 진행 이벤트가 없어 응답 전까지 표시하는 진행률은 추정값이다.
+const STAGE_RANGE: Record<Exclude<AudioStage, null>, { from: number; to: number; label: string }> = {
+  transcribing: { from: 5, to: 95, label: "음성 처리 중 (대용량은 자동 분할되며 시간이 걸릴 수 있습니다)" },
+};
+const SAMPLE_NOTES = [
+  `[신규 쇼핑몰 프로젝트 킥오프 회의록]
+일자: 2026-08-19
+참석자: PM, 개발팀장, 디자인팀장, 마케팅팀장
+
+1. 배경 및 문제의식
+- 기존 자사몰 앱은 출시 3년 차로 최근 6개월간 재방문율이 전년 대비 18% 하락했고, 특히 야간 시간대(21시~02시) 이탈률이 높다는 데이터가 있음.
+- 신규 회원가입 단계에서 이탈이 큰데, 설문 결과 "이메일 회원가입 절차가 번거롭다"는 응답이 가장 많았음.
+
+2. 결정 사항
+- 다크모드: 시스템 설정 연동 + 앱 내 수동 전환 스위치 둘 다 지원.
+- 소셜 로그인: 카카오·구글·네이버 3개사 우선 지원.
+- AI 상품 추천: 최근 30일 검색 기록 + 장바구니 데이터를 기반으로 메인 화면 하단에 노출.
+
+3. 다음 액션
+- 디자인팀: 8/26까지 다크모드 시안 1차 초안 공유.
+- 개발팀: 8/28 소셜 로그인 3사 API 키 발급 신청.`,
+
+  `[내부 인트라넷 인사관리 기능 추가 회의록]
+일자: 2026-08-20
+참석자: 인사팀장, IT지원팀, 총무팀 담당자
+
+1. 배경 및 목적
+- 현재 '연차 휴가 신청'과 '출장 보고서'를 엑셀과 이메일로 관리하고 있는데, 인사팀 기준 월평균 40건 이상의 신청을 수기로 취합하다 보니 누락·중복 승인 사고가 최근 2건 발생함.
+
+2. 연차 신청 기능 상세
+- 달력 UI에서 시작일/종료일 선택. 주말·공휴일은 자동으로 신청 대상에서 제외.
+- 반차(오전/오후) 선택 옵션 제공.
+- 신청 즉시 담당 팀장에게 사내 메신저 + 이메일 동시 알림 발송.
+
+3. 결정 사항
+- 연차 신청은 반차(오전/오후) 옵션까지 포함해 이번 스코프에 반드시 넣기로 확정함.
+- 출장 보고서 영수증 첨부는 이미지 파일 다중 첨부까지만 지원.`,
+];
+
+export function NewDocumentModal({
+  onClose,
+}: {
+  onClose: (projectId?: number, createdNoteId?: number) => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [meetingDate, setMeetingDate] = useState("");
+  const [attendees, setAttendees] = useState<string[]>([]);
+  const [memberNames, setMemberNames] = useState<string[]>([]);
+  const [content, setContent] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const [audioStage, setAudioStage] = useState<AudioStage>(null);
+  const [audioProgress, setAudioProgress] = useState(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 2026-09-21 (사용자 요청): 기존 프로젝트에 붙이는 선택지(드롭다운) 자체를 없애고,
+  // 새 회의록/문서는 항상 새 프로젝트를 만든다 — 입력창 하나로 단순화.
+  const [newProjectName, setNewProjectName] = useState("");
+
+  // 참석자 드롭박스 후보 — DB에 등록된 사람 이름. 목록에 없는 사람은 TagAutocomplete에서 직접 입력해 추가할 수 있다.
+  useEffect(() => {
+    apiFetch<any[]>("/api/users/?simple=true")
+      .then(list => setMemberNames(list.map((u: any) => u.full_name || u.username).filter(Boolean)))
+      .catch(() => {});
+  }, []);
+
+  const deriveTitleFromContent = (text: string) => {
+    const firstLine = text.split("\n").map(l => l.trim()).find(l => l.length > 0) ?? "";
+    const bracketMatch = firstLine.match(/^\[(.+)\]$/);
+    const base = (bracketMatch ? bracketMatch[1] : firstLine).slice(0, 40);
+    return base || `새 문서 ${new Date().toLocaleTimeString()}`;
+  };
+
+  // 파일을 첨부하면 그 파일명을 제목 기본값으로 쓴다 — 내용에서 제목을 뽑는 방식
+  // (deriveTitleFromContent)은 원본이 "# 회의록" 같은 마크다운 헤더나 표로 시작하면
+  // 엉뚱한 제목이 되는 문제가 있었다(실제로 겪음). 파일명은 보통 이미 "개발_기획회의_0911"
+  // 처럼 회의를 식별할 수 있게 지어져 있어 확장자만 떼면 바로 쓸 만한 제목이 된다.
+  const filenameToTitle = (filename: string) => filename.replace(/\.[^./\\]+$/, "");
+
+  const extractMeetingDate = (text: string): string | null => {
+    const keywordLine = text.split("\n").find(l => /(일자|날짜|회의일시|작성일)/.test(l));
+    const searchIn = keywordLine ?? text;
+    const isoMatch = searchIn.match(/(\d{4})[.\-](\d{1,2})[.\-](\d{1,2})/);
+    if (isoMatch) {
+      const [, y, m, d] = isoMatch;
+      if (Number(m) >= 1 && Number(m) <= 12 && Number(d) >= 1 && Number(d) <= 31) {
+        return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+      }
+    }
+    const korMatch = searchIn.match(/(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일/);
+    if (korMatch) {
+      const [, y, m, d] = korMatch;
+      return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    }
+    return null;
+  };
+
+  // 참석자는 수동 입력만 받는다 — 예전엔 원본 내용에 등록된 팀원 이름이 보이면 자동으로
+  // 참석자 태그에 추가했는데, 본문에 이름이 언급됐다고 실제 참석자인 건 아니라서(예: "OOO팀장
+  // 요청으로") 잘못 채워지는 경우가 있었다(사용자가 실제로 겪음). 회의 일시는 원본에 "일자:"
+  // 같은 명시적 표기가 있으면 그대로 옮겨적는 것뿐이라 오탐 여지가 적어 자동 추출을 유지한다.
+  useEffect(() => {
+    if (!content.trim()) return;
+    const timer = setTimeout(() => {
+      setMeetingDate(prev => prev || extractMeetingDate(content) || "");
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [content]);
+
+  const handleLoadSample = () => {
+    const randomIndex = Math.floor(Math.random() * SAMPLE_NOTES.length);
+    const sample = SAMPLE_NOTES[randomIndex];
+    setContent(sample);
+    if (!title.trim()) setTitle(deriveTitleFromContent(sample));
+  };
+
+  // 요청 중에는 추정 진행률을 상한까지 올리고, 전사가 완료되면 100%로 표시한다.
+  const runAudioStage = async <T,>(stage: Exclude<AudioStage, null>, task: () => Promise<T>): Promise<T> => {
+    const range = STAGE_RANGE[stage];
+    setAudioStage(stage);
+    setAudioProgress(range.from);
+    const interval = setInterval(() => {
+      setAudioProgress(p => {
+        const remaining = range.to - p;
+        return remaining <= 1 ? p : p + Math.max(1, remaining * 0.12);
+      });
+    }, 350);
+    try {
+      const result = await task();
+      setAudioProgress(100);
+      return result;
+    } finally {
+      clearInterval(interval);
+    }
+  };
+
+  const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // 같은 파일을 다시 선택해도 onChange가 다시 뜨도록 초기화
+    if (!file) return;
+
+    const audio = isAudioFile(file.name);
+    if (audio && (file.size === 0 || file.size > 200 * 1024 * 1024)) {
+      setError("음성 파일은 0바이트 초과, 200MB 이하여야 합니다.");
+      return;
+    }
+    setError("");
+
+    if (!hasRequiredPrefix(file.name)) {
+      setError(
+        `회의록 제목이 개발과 관련되어 있지 않습니다. 파일명이 "${REQUIRED_FILENAME_PREFIX}"로 시작해야 합니다. (예: 개발_기획회의_0911)`
+      );
+      return;
+    }
+
+    if (!title.trim()) setTitle(filenameToTitle(file.name));
+
+    setUploadingFile(true);
+    try {
+      if (audio) {
+        const formData = new FormData();
+        formData.append("file", file);
+        const { transcript } = await runAudioStage("transcribing", () =>
+          directUploadFetch<{ transcript: string }>("/api/meetings/notes/transcribe-audio/", formData)
+        );
+        setContent(formatTranscriptSentences(transcript));
+      } else {
+        const formData = new FormData();
+        formData.append("file", file);
+        // 문서 파일(최대 10MB)도 Vercel 프록시의 4.5MB 본문 제한에 걸려 6MB PDF가 413이었다 —
+        // 음성 파일과 같은 방식으로 프록시를 거치지 않고 백엔드로 직접 올린다.
+        const result = await directUploadFetch<{ content: string; filename: string }>(
+          "/api/meetings/notes/parse-file/",
+          formData
+        );
+        setContent(result.content);
+      }
+    } catch (err: any) {
+      setError(err.message || (audio ? "음성 파일을 텍스트로 변환하지 못했습니다." : "파일에서 텍스트를 추출하지 못했습니다."));
+    } finally {
+      setUploadingFile(false);
+      setAudioStage(null);
+      setAudioProgress(0);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    if (!content.trim()) return;
+    if (!newProjectName.trim()) return;
+
+    const finalTitle = title.trim() || deriveTitleFromContent(content);
+
+    setIsLoading(true);
+    try {
+      const newProject = await apiFetch<ProjectOption>("/api/projects/", {
+        method: "POST",
+        body: JSON.stringify({ name: newProjectName.trim() }),
+      });
+      const targetProjectId = newProject.id;
+
+      const note = await apiFetch<any>("/api/meetings/notes/", {
+        method: "POST",
+        body: JSON.stringify({
+          project: targetProjectId,
+          title: finalTitle,
+          content,
+          meeting_date: meetingDate || null,
+          attendees: attendees.length > 0 ? attendees.join(", ") : null,
+        }),
+      });
+
+      onClose(targetProjectId, note.id);
+    } catch (err: any) {
+      setError(err.message || "문서 생성 중 오류가 발생했습니다.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    // 2026-09-22 (사용자 리포트): 우측 근거 패널(EvidencePanel, z-[120])이 열려있는
+    // 상태에서 "새 회의록 / 문서"를 열면 이 모달이 z-50이라 패널 뒤/위에 어색하게
+    // 겹쳐 보였다 — 이 모달은 항상 최상단이어야 하므로 그보다 높은 z-index를 준다.
+    <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+      <div className="bg-background rounded-2xl shadow-2xl w-full max-w-3xl border border-border flex flex-col max-h-[95vh]">
+        <div className="flex justify-between items-center p-5 border-b border-border shrink-0">
+          <div>
+            <h2 className="text-2xl font-bold flex items-center gap-2">
+              <FileText className="w-6 h-6 text-primary" />
+              새 회의록 / 문서
+            </h2>
+            <p className="text-muted-foreground text-sm mt-1">회의 내용을 자유롭게 작성하세요.</p>
+          </div>
+          <button
+            onClick={() => onClose()}
+            className="text-muted-foreground hover:bg-black/5 dark:hover:bg-white/5 p-2 rounded-lg transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-5 flex-1 overflow-y-auto space-y-4">
+          {error && (
+            <div className="p-3 rounded-lg bg-red-500/10 text-red-500 text-sm">{error}</div>
+          )}
+
+          <form id="doc-form" onSubmit={handleSubmit} className="space-y-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">문서 제목 (선택)</label>
+              <input
+                type="text"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="비워두면 내용에서 자동으로 생성됩니다"
+                className="w-full bg-black/5 dark:bg-white/5 border border-border rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-primary/50 font-medium"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1 flex items-center gap-1.5"><FolderKanban className="w-3.5 h-3.5" /> 새 프로젝트 이름</label>
+              <input
+                type="text"
+                required
+                value={newProjectName}
+                onChange={(e) => setNewProjectName(e.target.value)}
+                placeholder="예: 사내 인트라넷 고도화"
+                className="w-full bg-black/5 dark:bg-white/5 border border-border rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-1 flex items-center gap-1.5"><CalendarIcon className="w-3.5 h-3.5" /> 회의 일시 (선택)</label>
+                <input
+                  type="date"
+                  value={meetingDate}
+                  onChange={(e) => setMeetingDate(e.target.value)}
+                  className="w-full bg-black/5 dark:bg-white/5 border border-border rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+                />
+                <p className="text-xs text-muted-foreground mt-1">회의일시를 입력하지 않을 시 오늘 날짜로 진행됩니다.</p>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1 flex items-center gap-1.5"><Users className="w-3.5 h-3.5" /> 참석자 (선택)</label>
+                <TagAutocomplete
+                  value={attendees}
+                  onChange={setAttendees}
+                  suggestions={memberNames}
+                  placeholder="이름 선택 또는 직접 입력"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-col">
+              <div className="flex justify-between items-center mb-1">
+                <label className="block text-sm font-medium">원본 내용 (회의록/메모)</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".docx,.pdf,.txt,.hwp,.md,.mp3,.mp4,.mpeg,.mpga,.m4a,.wav,.webm"
+                    onChange={handleFileSelected}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploadingFile}
+                    className="flex items-center gap-1 text-xs font-semibold text-primary hover:text-primary/80 bg-primary/10 px-3 py-1 rounded-full transition-colors disabled:opacity-50"
+                    title="지원 형식: .docx, .pdf, .txt, .hwp, .md / 음성: .mp3, .mp4, .wav, .m4a, .webm (최대 200MB, 대용량 자동 분할)"
+                  >
+                    {uploadingFile ? <Loader2 className="w-3 h-3 animate-spin" /> : <Paperclip className="w-3 h-3" />}
+                    {uploadingFile ? (audioStage ? `${STAGE_RANGE[audioStage].label}...` : "추출 중...") : "파일/음성에서 불러오기"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleLoadSample}
+                    className="text-xs font-semibold text-blue-500 hover:text-blue-600 bg-blue-500/10 px-3 py-1 rounded-full transition-colors"
+                  >
+                    랜덤 샘플 불러오기
+                  </button>
+                </div>
+              </div>
+              {audioStage && (
+                <div className="mb-2">
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="text-xs text-muted-foreground">
+                      {STAGE_RANGE[audioStage].label}
+                    </span>
+                    <span className="text-xs font-semibold text-primary">{Math.round(audioProgress)}%</span>
+                  </div>
+                  <div className="h-1.5 w-full bg-black/10 dark:bg-white/10 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-primary rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${audioProgress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+              <textarea
+                required
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                placeholder="회의 내용이나 기획 아이디어를 자유롭게 작성하세요."
+                className="w-full min-h-[220px] bg-black/5 dark:bg-white/5 border border-border rounded-lg px-4 py-3 resize-none focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm leading-relaxed"
+              />
+            </div>
+          </form>
+        </div>
+
+        <div className="flex justify-end gap-3 p-5 border-t border-border shrink-0 bg-black/5 dark:bg-white/5">
+          <button
+            type="button"
+            onClick={() => onClose()}
+            className="px-5 py-2.5 font-medium text-sm text-muted-foreground hover:bg-black/10 dark:hover:bg-white/10 rounded-lg transition-colors"
+          >
+            취소
+          </button>
+          <button
+            form="doc-form"
+            type="submit"
+            disabled={isLoading || !content.trim() || !newProjectName.trim()}
+            className="flex items-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90 px-8 py-2.5 rounded-lg transition-colors text-sm font-medium shadow-lg shadow-primary/20 disabled:opacity-50"
+          >
+            {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+            문서 저장 및 시작하기
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

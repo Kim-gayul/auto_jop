@@ -1,0 +1,445 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import { MoreHorizontal, CheckCircle2, XCircle, UserPlus, Loader2, X, MessageSquare, AlertTriangle } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { isTaskOverdue } from "@/lib/taskOverdue";
+import { DndContext, DragOverlay, closestCorners, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { TaskDetailModal } from "../projects/TaskDetailModal";
+import { useAuth } from "@/lib/auth";
+import { Toast } from "@/components/ui/Toast";
+import { apiFetch } from "@/lib/api/client";
+
+// 2026-09-01: Django TaskAssignment의 실제 상태값에 맞게 재배선했다. heyzzabi2 시절엔
+// 대기(미배정)->배분승인대기->진행중->완료 4단계였는데, Django에서는 업무가 자동배정
+// (auto-assign) 시점에 이미 담당자가 정해진 채로 "승인대기"에서 시작한다 — 미배정
+// 대기(BACKLOG) 개념 자체가 없다. 대신 반려가 별도 종결 상태로 존재한다.
+// 2026-09-15: id는 실제 common_code.code_id(TASK_STATUS)와 일치해야 한다 — "COMPLETED"/
+// "REJECTED"는 한 번도 TASK_STATUS에 존재한 적 없는 값이라(REQSPEC_STATUS/PROJECT_STATUS가
+// 선점) 실제 값(DONE/CANCELLED)으로 맞춘다(backend/tasks/models.py TaskStatusCode 참고).
+const COLUMNS = [
+  { id: "PENDING_APPROVAL", title: "승인 대기", color: "bg-orange-500/20" },
+  { id: "IN_PROGRESS", title: "진행 중", color: "bg-primary/20" },
+  { id: "DONE", title: "완료", color: "bg-emerald-500/20" },
+  { id: "CANCELLED", title: "반려됨", color: "bg-red-500/20" },
+];
+
+// 2026-09-28 (사용자 리포트): 카드를 드래그해 컬럼을 옮겨도(승인됨은 별도 컬럼이
+// 없어 "진행 중"으로 합쳐 보여주지만, 실제 전이 대상은 IN_PROGRESS/DONE뿐 —
+// PENDING_APPROVAL/CANCELLED는 아래 handleDragEnd에서 드롭 자체를 막음) 진행률이
+// 안 따라오던 문제 — tasks/page.tsx 리스트/WBS 뷰와 같은 기준으로 맞춘다.
+const STATUS_TO_PROGRESS: Record<string, number> = { TASK_APPROVED: 0, IN_PROGRESS: 5, DONE: 100 };
+
+function AssigneeBadge({ task, members, onAssign, readOnly }: { task: any; members: any[]; onAssign: (taskId: number, userId: string) => void; readOnly?: boolean }) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  // 담당자 재배정은 PM의 권한 — 일반 유저에게는 클릭해도 아무 일도 안 일어나는 뱃지로만 보여준다
+  if (readOnly) {
+    return (
+      <span className="bg-black/5 dark:bg-white/5 text-muted-foreground px-2 py-1 rounded-md font-medium truncate max-w-[120px] inline-block">
+        {task.assigned_user_name || "미배정"}
+      </span>
+    );
+  }
+
+  return (
+    <div className="relative">
+      <button
+        onClick={(e) => { e.stopPropagation(); setIsOpen(!isOpen); }}
+        className="bg-primary/10 text-primary px-2 py-1 rounded-md font-medium truncate max-w-[120px] hover:bg-primary/20 transition-colors flex items-center gap-1"
+      >
+        {task.assigned_user_name || <><UserPlus className="w-3 h-3" /> 미배정</>}
+      </button>
+
+      {isOpen && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={(e) => { e.stopPropagation(); setIsOpen(false); }} />
+          <div className="absolute left-0 mt-1 w-40 bg-card border border-border rounded-lg shadow-xl z-50 overflow-hidden">
+            <div className="p-2 text-xs font-semibold text-muted-foreground bg-muted/50">담당자 재배정</div>
+            <div className="max-h-48 overflow-y-auto">
+              {members.map((member: any) => (
+                <button
+                  key={member.id}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAssign(task.id, member.id);
+                    setIsOpen(false);
+                  }}
+                  className="w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors font-medium"
+                >
+                  {member.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function SortableTask({ task, members, onAssign, onClick, isPM, onApprove, onReject, processing, currentUserId, projectNameById }: any) {
+  // 칸반 카드를 드래그해 상태를 바꾸는 것도 "내 업무" 아니면 PM만 — 예전엔 아무 카드나 아무나 옮길 수 있었다.
+  const canManage = isPM || String(task.assigned_user) === String(currentUserId);
+  // 승인대기/반려 상태는 드래그로 옮길 수 없다 — 승인/반려 버튼으로만 상태가 바뀐다.
+  const draggable = canManage && task.status_code !== "PENDING_APPROVAL" && task.status_code !== "CANCELLED";
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: task.id, data: { type: "Task", task }, disabled: !draggable });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  // 2026-09-28 (사용자 리포트): 배분 승인/반려는 배정받은 담당자 본인 권한이라 리스트
+  // 뷰에서는 이미 PM에게 "배분승인대기" 배지만, 담당자 본인에게 반려/승인 버튼을
+  // 보여주는데(tasks/page.tsx 참고), 칸반 뷰만 반대로 PM에게 버튼이 보이고 있었다 —
+  // 리스트 뷰와 같은 기준으로 맞춘다.
+  const isPendingApproval = task.status_code === "PENDING_APPROVAL";
+  const showApprovalActions = !isPM && isPendingApproval;
+  const overdue = isTaskOverdue({ wbsEnd: task.end_date, status: task.status_code });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...(draggable ? attributes : {})}
+      {...(draggable ? listeners : {})}
+      onClick={() => onClick(task)}
+      className={cn(
+        "bg-white dark:bg-white/5 hover:bg-zinc-50 dark:hover:bg-white/10 border border-zinc-200 dark:border-white/10 shadow-sm hover:shadow-md rounded-lg p-4 transition-all group relative",
+        draggable ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
+        isDragging && "opacity-50 border-primary shadow-lg ring-2 ring-primary/20"
+      )}
+    >
+      {task.project != null && projectNameById?.get(String(task.project)) && (
+        <div className="text-[11px] font-bold text-primary mb-1">{projectNameById.get(String(task.project))}</div>
+      )}
+      <div className="flex justify-between items-start mb-2">
+        <div className="flex items-center gap-1.5">
+          {overdue && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-red-500/10 text-red-500">
+              <AlertTriangle className="w-3 h-3" /> 지연
+            </span>
+          )}
+        </div>
+        <button className="text-transparent group-hover:text-muted-foreground hover:!text-foreground">
+          <MoreHorizontal className="w-4 h-4" />
+        </button>
+      </div>
+      <h4 className="font-medium text-sm leading-tight mb-1">{task.title}</h4>
+      <p className="text-[11px] text-muted-foreground mb-3">{task.req_code} {task.req_name}</p>
+
+      {task.status_code === "CANCELLED" && task.reject_reason && (
+        <p className="text-[11px] text-red-400 mb-3 line-clamp-2">반려됨: {task.reject_reason}</p>
+      )}
+
+      <div className="flex items-center justify-between text-xs text-muted-foreground border-t border-border pt-3 mt-3">
+        <AssigneeBadge task={task} members={members} onAssign={onAssign} readOnly={!isPM} />
+        {task.progress > 0 && <span className="font-medium text-primary">{task.progress}%</span>}
+      </div>
+
+      {isPM && isPendingApproval && (
+        <div className="flex items-center border-t border-border pt-3 mt-3">
+          <span className="inline-block text-xs font-bold px-2.5 py-1.5 rounded-lg bg-orange-500/10 text-orange-500">
+            배분승인대기
+          </span>
+        </div>
+      )}
+
+      {showApprovalActions && (
+        <div className="flex items-center gap-2 border-t border-border pt-3 mt-3" onClick={(e) => e.stopPropagation()}>
+          <button
+            onClick={() => onReject(task)}
+            disabled={processing === task.id}
+            className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md bg-red-500/10 text-red-400 hover:bg-red-500/20 text-xs font-semibold transition-colors disabled:opacity-50"
+          >
+            <XCircle className="w-3.5 h-3.5" /> 반려
+          </button>
+          <button
+            onClick={() => onApprove(task)}
+            disabled={processing === task.id}
+            className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 text-xs font-semibold transition-colors disabled:opacity-50"
+          >
+            {processing === task.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />} 승인
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KanbanColumn({ column, tasks, members, onAssign, onCardClick, isPM, onApprove, onReject, processing, currentUserId, projectNameById }: any) {
+  const { setNodeRef } = useSortable({
+    id: column.id,
+    data: { type: "Column", column },
+  });
+
+  return (
+    <div className="w-full min-w-0 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 shadow-lg rounded-xl flex flex-col overflow-hidden">
+      <div className="p-3 border-b border-border flex items-center justify-between bg-zinc-50/50 dark:bg-zinc-800/50 shrink-0">
+        <div className="flex items-center gap-2">
+          <div className={cn("w-3 h-3 rounded-full", column.color)} />
+          <h3 className="font-semibold text-sm">{column.title}</h3>
+          <span className="text-xs bg-black/10 dark:bg-white/10 px-2 py-0.5 rounded-full text-muted-foreground">
+            {tasks.length}
+          </span>
+        </div>
+      </div>
+
+      {/* 2026-09-15: 위 주석(칸마다 스크롤바 vs 페이지 전체 스크롤)의 절충안 — 카드가
+          6장 정도(약 820px)까지는 그대로 다 보이고, 그보다 많아지면 이 컬럼만
+          스크롤되게 한다(사용자 요청). max-h를 넘기기 전까지는 기존과 동일하게
+          내용 높이만큼만 차지해서, 카드가 적은 칸이 불필요하게 커지지 않는다. */}
+      <div ref={setNodeRef} className="flex-1 p-3 space-y-3 min-h-[200px] max-h-[820px] overflow-y-auto">
+        <SortableContext items={tasks.map((t: any) => t.id)} strategy={verticalListSortingStrategy}>
+          {tasks.map((task: any) => (
+            <SortableTask
+              key={task.id}
+              task={task}
+              members={members}
+              onAssign={onAssign}
+              onClick={onCardClick}
+              isPM={isPM}
+              onApprove={onApprove}
+              onReject={onReject}
+              processing={processing}
+              currentUserId={currentUserId}
+              projectNameById={projectNameById}
+            />
+          ))}
+          {tasks.length === 0 && (
+            <p className="text-center text-xs text-muted-foreground py-8">업무가 없습니다.</p>
+          )}
+        </SortableContext>
+      </div>
+    </div>
+  );
+}
+
+export function KanbanBoard({ initialTasks, members = [], onTaskChange, projectNameById }: { projectId?: string; initialTasks: any[]; members?: any[]; onTaskChange?: (taskId: number, patch: Record<string, any>) => void; projectNameById?: Map<string, string> }) {
+  const { user } = useAuth();
+  const isPM = user?.role === "PM";
+  const [tasks, setTasks] = useState(initialTasks);
+  const [activeTask, setActiveTask] = useState<any | null>(null);
+  const [selectedTaskForDetail, setSelectedTaskForDetail] = useState<any | null>(null);
+  const [processing, setProcessing] = useState<number | null>(null);
+  const [rejectTarget, setRejectTarget] = useState<any | null>(null);
+  const [rejectReason, setRejectReason] = useState("");
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [errorToast, setErrorToast] = useState<string | null>(null);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  );
+
+  const handleAssign = async (taskId: number, userId: string) => {
+    const prev = tasks;
+    const selectedMember = members.find((m: any) => m.id === userId);
+    const patch = { assigned_user: userId, assigned_user_name: selectedMember?.name };
+    setTasks((cur) => cur.map((t) => t.id === taskId ? { ...t, ...patch } : t));
+    onTaskChange?.(taskId, patch);
+    try {
+      await apiFetch(`/api/tasks/assignments/${taskId}/`, {
+        method: "PATCH",
+        body: JSON.stringify({ assigned_user: userId }),
+      });
+    } catch (e: any) {
+      setTasks(prev);
+      onTaskChange?.(taskId, prev.find((t) => t.id === taskId) ?? {});
+      setErrorToast(e.message || "담당자 재배정에 실패했습니다.");
+    }
+  };
+
+  const commitStatusChange = async (taskId: number, newStatus: string) => {
+    const prev = tasks;
+    const newProgress = STATUS_TO_PROGRESS[newStatus];
+    const patch = newProgress !== undefined ? { status_code: newStatus, progress: newProgress } : { status_code: newStatus };
+    setTasks((cur) => cur.map((t) => t.id === taskId ? { ...t, ...patch } : t));
+    onTaskChange?.(taskId, patch);
+    try {
+      await apiFetch(`/api/tasks/assignments/${taskId}/status/`, {
+        method: "PATCH",
+        body: JSON.stringify({ status_code: newStatus }),
+      });
+      if (newProgress !== undefined) {
+        await apiFetch(`/api/tasks/assignments/${taskId}/`, {
+          method: "PATCH",
+          body: JSON.stringify({ progress: newProgress }),
+        });
+      }
+    } catch (e: any) {
+      setTasks(prev);
+      onTaskChange?.(taskId, { status_code: prev.find((t) => t.id === taskId)?.status_code });
+      setErrorToast(e.message || "상태 변경에 실패했습니다.");
+    }
+  };
+
+  const handleDragStart = (event: any) => {
+    const { active } = event;
+    const task = tasks.find((t) => t.id === active.id);
+    if (task) setActiveTask(task);
+  };
+
+  const handleDragEnd = (event: any) => {
+    const { active, over } = event;
+    setActiveTask(null);
+    if (!over) return;
+
+    const activeId = active.id;
+    const overId = over.id;
+    if (activeId === overId) return;
+
+    const draggedTask = tasks.find((t) => t.id === activeId);
+    const overColumnId = COLUMNS.find((c) => c.id === overId)?.id || tasks.find((t) => t.id === overId)?.status_code;
+    if (!draggedTask || !overColumnId || draggedTask.status_code === overColumnId) return;
+    // useSortable의 disabled로 이미 막지만, 한 번 더 확인 — 남의 업무는 PM이 아니면 옮길 수 없다
+    if (!isPM && String(draggedTask.assigned_user) !== String(user?.id)) return;
+    // 승인대기/반려로는 드래그로 못 들어간다 — 승인/반려 버튼 또는 서버 로직으로만 전이된다
+    if (overColumnId === "PENDING_APPROVAL" || overColumnId === "CANCELLED") return;
+
+    commitStatusChange(activeId, overColumnId);
+  };
+
+  const handleApprove = async (task: any) => {
+    setProcessing(task.id);
+    try {
+      await apiFetch(`/api/tasks/assignments/${task.id}/status/`, {
+        method: "PATCH",
+        body: JSON.stringify({ status_code: "TASK_APPROVED" }),
+      });
+      setTasks((prev) => prev.map((t) => t.id === task.id ? { ...t, status_code: "TASK_APPROVED", reject_reason: null } : t));
+      onTaskChange?.(task.id, { status_code: "TASK_APPROVED", reject_reason: null });
+      setToastMessage("업무가 승인되었습니다");
+    } catch (e: any) {
+      setErrorToast(e.message || "승인에 실패했습니다.");
+    } finally {
+      setProcessing(null);
+    }
+  };
+
+  const handleReject = async () => {
+    if (!rejectTarget || !rejectReason.trim()) return;
+    setProcessing(rejectTarget.id);
+    try {
+      await apiFetch(`/api/tasks/assignments/${rejectTarget.id}/status/`, {
+        method: "PATCH",
+        body: JSON.stringify({ status_code: "CANCELLED", reject_reason: rejectReason }),
+      });
+      setTasks((prev) => prev.map((t) => t.id === rejectTarget.id ? { ...t, status_code: "CANCELLED", reject_reason: rejectReason } : t));
+      onTaskChange?.(rejectTarget.id, { status_code: "CANCELLED", reject_reason: rejectReason });
+      setRejectTarget(null);
+      setRejectReason("");
+      setToastMessage("업무가 반려되었습니다");
+    } catch (e: any) {
+      setErrorToast(e.message || "반려에 실패했습니다.");
+    } finally {
+      setProcessing(null);
+    }
+  };
+
+  // 부모가 새 initialTasks를 내려주면(다른 화면에서 갱신된 목록을 다시 조회) 내부 상태도 맞춘다
+  useEffect(() => { setTasks(initialTasks) }, [initialTasks]);
+
+  // 승인됨(TASK_APPROVED)은 화면에 별도 컬럼을 안 두고 "진행 중" 칸에 같이 보여준다 — 승인만
+  // 되고 아직 진행 상태로 안 옮겨진 업무가 승인대기 칸에도 진행 칸에도 안 보여 사라진 것처럼
+  // 보이는 문제를 피하기 위함(담당자가 드래그로 직접 진행 중으로 옮기기 전까지의 과도 상태).
+  const columnTasks = (columnId: string) =>
+    tasks.filter((t) => columnId === "IN_PROGRESS" ? (t.status_code === "IN_PROGRESS" || t.status_code === "TASK_APPROVED") : t.status_code === columnId);
+
+  return (
+    <>
+      <Toast message={toastMessage} onDismiss={() => setToastMessage(null)} />
+      <Toast message={errorToast} variant="error" onDismiss={() => setErrorToast(null)} />
+      <DndContext sensors={sensors} collisionDetection={closestCorners} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
+        {/* 컬럼 4개가 가로 스크롤 없이 화면 폭에 맞춰 균등하게 나뉘도록 grid로 배치 — 완료 컬럼까지 한 화면에 다 보이게.
+            여기서 전체 높이를 가두진 않는다 — 카드 6장 정도까지는 컬럼이 내용 높이만큼 자연스럽게
+            늘어나고, 그보다 많아지면 KanbanColumn 안쪽(max-h-[820px] + overflow-y-auto)에서
+            그 컬럼만 스크롤된다(2026-09-15, 사용자 요청 — 첨부파일 등으로 카드가 6개 넘게
+            쌓이는 칸이 생기면서 페이지 전체 스크롤만으로는 다른 칸을 보기 번거로워짐). */}
+        <div className="w-full pb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-start">
+            <SortableContext items={COLUMNS.map((c) => c.id)}>
+              {COLUMNS.map((col) => (
+                <KanbanColumn
+                  key={col.id}
+                  column={col}
+                  tasks={columnTasks(col.id)}
+                  members={members}
+                  onAssign={handleAssign}
+                  onCardClick={(t: any) => setSelectedTaskForDetail(t)}
+                  isPM={isPM}
+                  onApprove={handleApprove}
+                  onReject={(t: any) => setRejectTarget(t)}
+                  processing={processing}
+                  currentUserId={user?.id}
+                  projectNameById={projectNameById}
+                />
+              ))}
+            </SortableContext>
+          </div>
+        </div>
+        <DragOverlay>
+          {activeTask ? <SortableTask task={activeTask} members={members} onAssign={handleAssign} onClick={() => {}} isPM={isPM} processing={processing} currentUserId={user?.id} projectNameById={projectNameById} /> : null}
+        </DragOverlay>
+      </DndContext>
+
+      {selectedTaskForDetail && (
+        <TaskDetailModal
+          task={selectedTaskForDetail}
+          members={members}
+          onClose={() => setSelectedTaskForDetail(null)}
+          onUpdated={(updated: any) => {
+            setTasks((prev) => prev.map((t) => t.id === updated.id ? { ...t, ...updated } : t));
+            onTaskChange?.(updated.id, updated);
+          }}
+        />
+      )}
+
+      {/* 반려 사유 입력 모달 */}
+      {rejectTarget && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-background border border-border rounded-2xl p-6 shadow-2xl max-w-md w-full mx-4">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-lg font-bold flex items-center gap-2 text-red-400">
+                <XCircle className="w-5 h-5" /> 업무 반려
+              </h3>
+              <button onClick={() => setRejectTarget(null)} className="p-1.5 rounded-lg hover:bg-black/5 dark:hover:bg-white/5"><X className="w-4 h-4" /></button>
+            </div>
+            <p className="text-sm text-muted-foreground mb-4">
+              <span className="font-semibold text-foreground">"{rejectTarget.title}"</span> 업무를 반려합니다.
+            </p>
+            <div className="relative mb-4">
+              <MessageSquare className="w-4 h-4 absolute left-3 top-3.5 text-muted-foreground" />
+              <textarea
+                autoFocus
+                className="w-full pl-9 pr-4 py-3 bg-black/5 dark:bg-white/5 border border-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-red-500/30 resize-none h-24"
+                placeholder="반려 사유를 입력해주세요."
+                value={rejectReason}
+                onChange={(e) => setRejectReason(e.target.value)}
+              />
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => setRejectTarget(null)} className="flex-1 py-2.5 rounded-xl border border-border text-sm font-semibold hover:bg-black/5 dark:hover:bg-white/5">취소</button>
+              <button
+                onClick={handleReject}
+                disabled={!rejectReason.trim() || processing === rejectTarget.id}
+                className="flex-1 py-2.5 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm font-semibold hover:bg-red-500/20 disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {processing === rejectTarget.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <XCircle className="w-4 h-4" />} 반려 처리
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
